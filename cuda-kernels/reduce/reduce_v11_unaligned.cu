@@ -72,7 +72,8 @@ __device__ __forceinline__ int inc(int pos)
     return curr;
 }
 
-__global__ void reduce_v11(float *g_idata,float *g_odata, unsigned int n, int *error_cnt)
+//__global__ void reduce_v11(float *g_idata,float *g_odata, unsigned int n, int *error_cnt)
+__global__ void reduce_v11(float *g_idata,float *g_odata, unsigned int n)
 {
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
@@ -91,7 +92,7 @@ __global__ void reduce_v11(float *g_idata,float *g_odata, unsigned int n, int *e
     float* smem_addr = reinterpret_cast<float *>(&smem[curr * kSmemStageSize + smem_indx]);
     
     float sum = 0.0f;
-    int mismatch = 0;
+    //int mismatch = 0;
 
     if (gmem_indx < total_packs)
         preload_4(smem_addr, gmem_addr);
@@ -101,8 +102,8 @@ __global__ void reduce_v11(float *g_idata,float *g_odata, unsigned int n, int *e
         //__syncthreads();
         #pragma unroll 4
         for (int j=0; j < kPackSize; j++) {
-            if (smem[curr * kSmemStageSize + smem_indx + j] != gmem_addr[j])
-                mismatch++;
+            /*if (smem[curr * kSmemStageSize + smem_indx + j] != gmem_addr[j])
+                mismatch++;*/
             sum += smem[curr * kSmemStageSize + smem_indx + j];
        }
 
@@ -132,8 +133,8 @@ __global__ void reduce_v11(float *g_idata,float *g_odata, unsigned int n, int *e
                 preload_1(smem_addr, gmem_addr);
             wait<0>();
             for (int j=0; j < k; j++) {
-                if (smem[curr * kSmemStageSize + smem_indx + j] != gmem_addr[j])
-                    mismatch++;
+                /*if (smem[curr * kSmemStageSize + smem_indx + j] != gmem_addr[j])
+                    mismatch++;*/
                 sum += smem[curr * kSmemStageSize + smem_indx + j];
             }
             gmem_pack_indx = gmem_indx * kPackSize + k;
@@ -144,8 +145,8 @@ __global__ void reduce_v11(float *g_idata,float *g_odata, unsigned int n, int *e
         sum += g_idata[k];
 #endif
 
-    if (mismatch > 0)
-         atomicAdd(error_cnt, mismatch);
+    /*if (mismatch > 0)
+         atomicAdd(error_cnt, mismatch);*/
 
     typedef cub::BlockReduce<float, kBlockSize> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
@@ -190,13 +191,20 @@ int main(int argc, char **argv)
 
     cudaMemcpy(d_a,a,kN*sizeof(float),cudaMemcpyHostToDevice);;
 
-    int error_cnt = 0;
-    reduce_v11<<<block_num, kBlockSize, kSmemSize>>>(d_a, g_odata, kN, &error_cnt);
+    /*int error_cnt = 0;
+    int *error_cnt_d;
+    cudaMalloc((void **)&error_cnt_d, sizeof(int));
+    cudaMemcpy(error_cnt_d, &error_cnt, sizeof(int), cudaMemcpyHostToDevice);
+    reduce_v11<<<block_num, kBlockSize, kSmemSize>>>(d_a, g_odata, kN, error_cnt_d);*/
+    reduce_v11<<<block_num, kBlockSize, kSmemSize>>>(d_a, g_odata, kN);
     assert(!cudaGetLastError());
+    /*cudaMemcpy(&error_cnt, error_cnt_d, sizeof(int), cudaMemcpyDeviceToHost);
     assert(error_cnt == 0);
-    reduce_v11<<<1, kBlockSize, kSmemSize>>>(g_odata, g_final_data, block_num, &error_cnt);
+    reduce_v11<<<1, kBlockSize, kSmemSize>>>(g_odata, g_final_data, block_num, error_cnt_d);*/
+    reduce_v11<<<1, kBlockSize, kSmemSize>>>(g_odata, g_final_data, block_num);
     assert(!cudaGetLastError());
-    assert(error_cnt == 0);
+    /*cudaMemcpy(&error_cnt, error_cnt_d, sizeof(int), cudaMemcpyDeviceToHost);
+    assert(error_cnt == 0);*/
 
     cudaMemcpy(out,g_final_data,1*sizeof(float),cudaMemcpyDeviceToHost);
     double out_d = (double)out[0] * kMaxVal;
@@ -211,5 +219,6 @@ int main(int argc, char **argv)
     cudaFree(g_odata);
     free(a);
     free(out);
+    //cudaFree(error_cnt_d);
     return 0;
 }

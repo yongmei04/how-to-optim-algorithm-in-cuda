@@ -6,14 +6,15 @@
 #include <cuda_fp16.h>
 #include <assert.h>
 #include <cub/cub.cuh>
+
 using namespace std;
 
 constexpr int kN = 1024 * 1024 * 1024;
 constexpr int kPackSize = 4;
-constexpr int kBlockSize = 1024;
+constexpr int kBlockSize = 256;
 constexpr int kNumWaves = 1;
 constexpr int kMaxVal = 456;
-constexpr int kNumStages = 2;
+constexpr int kNumStages = 3;
 constexpr int kSmemStageSize = kBlockSize * kPackSize;
 constexpr int kSmemSize = kSmemStageSize * kNumStages * sizeof(float);
 
@@ -38,10 +39,8 @@ int64_t GetNumBlocks(int64_t n) {
   return num_blocks;
 }
 
-__device__ __forceinline__ void preload(float *smem_ptr, const float *gmem_ptr)
+__device__ __forceinline__ void commit_group()
 {
-    uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, 16;\n" ::"r"(smem_int_ptr), "l"(gmem_ptr));
     asm volatile("cp.async.commit_group;\n" ::);
 }
 
@@ -52,14 +51,41 @@ __device__ __forceinline__ void wait()
 }
 
 
-__device__ __forceinline__ int inc(int pos)
+__device__ __forceinline__ int stage_inc(int pos)
 {
     int curr = (pos + 1) % kNumStages;
     return curr;
 }
 
-//__global__ void reduce_v10(float *g_idata,float *g_odata, unsigned int n, int *error_cnt)
-__global__ void reduce_v10(float *g_idata,float *g_odata, unsigned int n)
+__device__ __forceinline__ float* get_gmem_addr(float *gmem, unsigned int gmem_indx)
+{
+    unsigned int gmem_pack_indx = gmem_indx * kPackSize;
+    float* gmem_addr = reinterpret_cast<float *>(&gmem[gmem_pack_indx]);
+    return gmem_addr;
+}
+
+__device__ __forceinline__ float* get_smem_addr(float *smem, int curr, unsigned int tid)
+{
+    unsigned int smem_pack_indx = tid * kPackSize;
+    float* smem_addr = reinterpret_cast<float *>(&smem[curr * kSmemStageSize + smem_pack_indx]);
+    return smem_addr;
+}
+
+__device__ __forceinline__ void preload_one_stage(float *gmem,
+                                                  float *smem,
+                                                  int curr,
+                                                  unsigned int gmem_indx,
+                                                  unsigned int tid)
+{
+    float* gmem_addr = get_gmem_addr(gmem, gmem_indx);
+    float* smem_addr = get_smem_addr(smem, curr, tid);
+
+    uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_addr));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, 16;\n" ::"r"(smem_int_ptr), "l"(gmem_addr));
+}
+
+//__global__ void reduce_v12(float *g_idata,float *g_odata, int n, int *error_cnt)
+__global__ void reduce_v12(float *g_idata,float *g_odata, int n)
 {
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
@@ -69,36 +95,58 @@ __global__ void reduce_v10(float *g_idata,float *g_odata, unsigned int n)
     extern __shared__ float smem[];
 
     unsigned int gmem_indx = bid * block_size + tid;
-    unsigned int gmem_pack_indx = gmem_indx * kPackSize;
-    unsigned int smem_indx = tid * kPackSize;
 
-    int curr = 0;
-
-    float* gmem_addr = reinterpret_cast<float *>(&g_idata[gmem_pack_indx]);
-    float* smem_addr = reinterpret_cast<float *>(&smem[curr * kSmemStageSize + smem_indx]);
-    
+    int preload_curr = -1, read_curr = -1;
     float sum = 0.0f;
     //int mismatch = 0;
+    unsigned int preload_gmem_indx = gmem_indx;
 
-    if (gmem_indx < total_packs)
-        preload(smem_addr, gmem_addr);
+    for (int preload_cnt = 0;
+         preload_gmem_indx < total_packs && preload_cnt < kNumStages - 1;
+         preload_gmem_indx += grid_size, preload_cnt++) {
+        preload_curr = stage_inc(preload_curr);
+        preload_one_stage(g_idata, smem, preload_curr, preload_gmem_indx, tid);
+        commit_group();
+    }
 
-    for(; gmem_indx < total_packs; gmem_indx += grid_size) {
+    for (; gmem_indx < total_packs && preload_gmem_indx < total_packs; gmem_indx += grid_size) {
+        wait<kNumStages - 2>();
+        read_curr = stage_inc(read_curr);
+
+        float4* smem_addr_v4 = reinterpret_cast<float4*>(get_smem_addr(smem, read_curr, tid));
+        float4 val = *smem_addr_v4;
+        sum += val.x;
+        sum += val.y;
+        sum += val.z;
+        sum += val.w;
+
+        /*float *gmem_addr = get_gmem_addr(g_idata, gmem_indx);
+        if (val.x != gmem_addr[0] || val.y != gmem_addr[1] || val.z != gmem_addr[2] || val.w != gmem_addr[3])
+            mismatch++;*/
+
+        if (preload_gmem_indx < total_packs) {
+            preload_curr = stage_inc(preload_curr);
+            preload_one_stage(g_idata, smem, preload_curr, preload_gmem_indx, tid);
+            commit_group();
+            preload_gmem_indx += grid_size;
+        }
+    }
+
+    if (gmem_indx < total_packs) {
         wait<0>();
-        //__syncthreads();
-        #pragma unroll 4
-        for (int j=0; j < kPackSize; j++) {
-            /*if (smem[curr * kSmemStageSize + smem_indx + j] != gmem_addr[j])
-                mismatch++;*/
-            sum += smem[curr * kSmemStageSize + smem_indx + j];
-       }
+        for (; gmem_indx < total_packs; gmem_indx += grid_size) {
+            read_curr = stage_inc(read_curr);
 
-        if (gmem_indx + grid_size < total_packs) {
-            curr = inc(curr);
-            gmem_pack_indx = (gmem_indx + grid_size) * kPackSize;
-            gmem_addr = reinterpret_cast<float*>(&g_idata[gmem_pack_indx]);
-            smem_addr = reinterpret_cast<float*>(&smem[curr * kSmemStageSize + smem_indx]);
-            preload(smem_addr, gmem_addr);
+            float4* smem_ptr_v4 = reinterpret_cast<float4*>(get_smem_addr(smem, read_curr, tid));
+            float4 val = *smem_ptr_v4;
+            sum += val.x;
+            sum += val.y;
+            sum += val.z;
+            sum += val.w;
+
+            /*float *gmem_addr = get_gmem_addr(g_idata, gmem_indx);
+            if (val.x != gmem_addr[0] || val.y != gmem_addr[1] || val.z != gmem_addr[2] || val.w != gmem_addr[3])
+                mismatch++;*/
         }
     }
 
@@ -152,13 +200,13 @@ int main(int argc, char **argv)
     int *error_cnt_d;
     cudaMalloc((void **)&error_cnt_d, sizeof(int));
     cudaMemcpy(error_cnt_d, &error_cnt, sizeof(int), cudaMemcpyHostToDevice);
-    reduce_v10<<<block_num, kBlockSize, kSmemSize>>>(d_a, g_odata, kN, error_cnt_d);*/
-    reduce_v10<<<block_num, kBlockSize, kSmemSize>>>(d_a, g_odata, kN);
+    reduce_v12<<<block_num, kBlockSize, kSmemSize>>>(d_a, g_odata, kN, error_cnt_d); */
+    reduce_v12<<<block_num, kBlockSize, kSmemSize>>>(d_a, g_odata, kN);
     assert(!cudaGetLastError());
     /*cudaMemcpy(&error_cnt, error_cnt_d, sizeof(int), cudaMemcpyDeviceToHost);
     assert(error_cnt == 0);
-    reduce_v10<<<1, kBlockSize, kSmemSize>>>(g_odata, g_final_data, block_num, error_cnt_d);*/
-    reduce_v10<<<1, kBlockSize, kSmemSize>>>(g_odata, g_final_data, block_num);
+    reduce_v12<<<1, kBlockSize, kSmemSize>>>(g_odata, g_final_data, block_num, error_cnt_d);*/
+    reduce_v12<<<1, kBlockSize, kSmemSize>>>(g_odata, g_final_data, block_num);
     assert(!cudaGetLastError());
     /*cudaMemcpy(&error_cnt, error_cnt_d, sizeof(int), cudaMemcpyDeviceToHost);
     assert(error_cnt == 0);*/

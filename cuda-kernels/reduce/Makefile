@@ -12,3 +12,6 @@ all:
 	/usr/local/cuda/bin/nvcc -o bin/reduce_v9 reduce_v9_cub_block_reduce.cu
 	/usr/local/cuda/bin/nvcc -arch=sm_86 -o bin/reduce_v10 reduce_v10_async_cp.cu
 	/usr/local/cuda/bin/nvcc -arch=sm_86 -o bin/reduce_v11 reduce_v11_unaligned.cu
+	/usr/local/cuda/bin/nvcc -arch=sm_86 -o bin/reduce_v12 reduce_v12_multi_stages_async_cp.cu
+clean:
+	rm -rf bin/*
